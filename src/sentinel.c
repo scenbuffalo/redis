@@ -73,6 +73,7 @@ typedef struct sentinelAddr {
 #define SENTINEL_ASK_PERIOD 1000
 #define SENTINEL_PUBLISH_PERIOD 2000
 #define SENTINEL_DEFAULT_DOWN_AFTER 30000
+#define SENTINEL_DEFAULT_LOADING_AS_PONG 1
 #define SENTINEL_HELLO_CHANNEL "__sentinel__:hello"
 #define SENTINEL_TILT_TRIGGER 2000
 #define SENTINEL_TILT_PERIOD (SENTINEL_PING_PERIOD*30)
@@ -177,6 +178,7 @@ typedef struct sentinelRedisInstance {
     mstime_t o_down_since_time; /* Objectively down since time. */
     mstime_t down_after_period; /* Consider it down after that period. */
     mstime_t info_refresh;  /* Time at which we received INFO output from it. */
+    int loading_as_pong; /* Let 'loading the dataset in memory' as pong.*/
 
     /* Role and the first time we observed it.
      * This is useful in order to delay replacing what the instance reports
@@ -1195,6 +1197,7 @@ sentinelRedisInstance *createSentinelRedisInstance(char *name, int flags, char *
                             SENTINEL_DEFAULT_DOWN_AFTER;
     ri->master_link_down_time = 0;
     ri->auth_pass = NULL;
+    ri->loading_as_pong = SENTINEL_DEFAULT_LOADING_AS_PONG;
     ri->slave_priority = SENTINEL_DEFAULT_SLAVE_PRIORITY;
     ri->slave_reconf_sent_time = 0;
     ri->slave_master_host = NULL;
@@ -1543,6 +1546,24 @@ sentinelAddr *sentinelGetCurrentMasterAddress(sentinelRedisInstance *master) {
     }
 }
 
+/* This function sets the loading_as_pong field value in 'master' to all
+ * the slaves and sentinel instances connected to this master. */
+void sentinelPropagateLoadingIsPong(sentinelRedisInstance *master) {
+    dictIterator *di;
+    dictEntry *de;
+    int j;
+    dict *d[] = {master->slaves, master->sentinels, NULL};
+
+    for (j = 0; d[j]; j++) {
+        di = dictGetIterator(d[j]);
+        while((de = dictNext(di)) != NULL) {
+            sentinelRedisInstance *ri = dictGetVal(de);
+            ri->loading_as_pong = master->loading_as_pong;
+        }
+        dictReleaseIterator(di);
+    }
+}
+
 /* This function sets the down_after_period field value in 'master' to all
  * the slaves and sentinel instances connected to this master. */
 void sentinelPropagateDownAfterPeriod(sentinelRedisInstance *master) {
@@ -1586,6 +1607,14 @@ char *sentinelHandleConfiguration(char **argv, int argc) {
             case EINVAL: return "Invalid port number";
             }
         }
+    } else if (!strcasecmp(argv[0],"loading-as-pong") && argc == 3) {
+        /* loading-as-pong <name> <yes|no> */
+        ri = sentinelGetMasterByName(argv[1]);
+        if (!ri) return "No such master with specified name.";
+        if (0 != strcasecmp(argv[2], "yes") && 0 != strcasecmp(argv[2], "no"))
+            return "parameter should be 'yes' or 'no'";
+        ri->loading_as_pong = (int)(0 == strcasecmp(argv[2], "yes"));
+        sentinelPropagateLoadingIsPong(ri);
     } else if (!strcasecmp(argv[0],"down-after-milliseconds") && argc == 3) {
         /* down-after-milliseconds <name> <milliseconds> */
         ri = sentinelGetMasterByName(argv[1]);
@@ -1601,19 +1630,19 @@ char *sentinelHandleConfiguration(char **argv, int argc) {
         ri->failover_timeout = atoi(argv[2]);
         if (ri->failover_timeout <= 0)
             return "negative or zero time parameter.";
-   } else if (!strcasecmp(argv[0],"parallel-syncs") && argc == 3) {
+    } else if (!strcasecmp(argv[0],"parallel-syncs") && argc == 3) {
         /* parallel-syncs <name> <milliseconds> */
         ri = sentinelGetMasterByName(argv[1]);
         if (!ri) return "No such master with specified name.";
         ri->parallel_syncs = atoi(argv[2]);
-   } else if (!strcasecmp(argv[0],"notification-script") && argc == 3) {
+    } else if (!strcasecmp(argv[0],"notification-script") && argc == 3) {
         /* notification-script <name> <path> */
         ri = sentinelGetMasterByName(argv[1]);
         if (!ri) return "No such master with specified name.";
         if (access(argv[2],X_OK) == -1)
             return "Notification script seems non existing or non executable.";
         ri->notification_script = sdsnew(argv[2]);
-   } else if (!strcasecmp(argv[0],"client-reconfig-script") && argc == 3) {
+    } else if (!strcasecmp(argv[0],"client-reconfig-script") && argc == 3) {
         /* client-reconfig-script <name> <path> */
         ri = sentinelGetMasterByName(argv[1]);
         if (!ri) return "No such master with specified name.";
@@ -1621,7 +1650,7 @@ char *sentinelHandleConfiguration(char **argv, int argc) {
             return "Client reconfiguration script seems non existing or "
                    "non executable.";
         ri->client_reconfig_script = sdsnew(argv[2]);
-   } else if (!strcasecmp(argv[0],"auth-pass") && argc == 3) {
+    } else if (!strcasecmp(argv[0],"auth-pass") && argc == 3) {
         /* auth-pass <name> <password> */
         ri = sentinelGetMasterByName(argv[1]);
         if (!ri) return "No such master with specified name.";
@@ -1723,6 +1752,14 @@ void rewriteConfigSentinelOption(struct rewriteConfigState *state) {
             line = sdscatprintf(sdsempty(),
                 "sentinel down-after-milliseconds %s %ld",
                 master->name, (long) master->down_after_period);
+            rewriteConfigRewriteLine(state,"sentinel",line,1);
+        }
+
+        /* sentinel loading-as-pong */
+        if (master->loading_as_pong != SENTINEL_DEFAULT_LOADING_AS_PONG) {
+            line = sdscatprintf(sdsempty(),
+                "sentinel loading-as-pong %s %s",
+                master->name, master->loading_as_pong ? "yes" : "no");
             rewriteConfigRewriteLine(state,"sentinel",line,1);
         }
 
@@ -2274,7 +2311,7 @@ void sentinelPingReplyCallback(redisAsyncContext *c, void *reply, void *privdata
         /* Update the "instance available" field only if this is an
          * acceptable reply. */
         if (strncmp(r->str,"PONG",4) == 0 ||
-            strncmp(r->str,"LOADING",7) == 0 ||
+            (strncmp(r->str,"LOADING",7) == 0 && ri->loading_as_pong) ||
             strncmp(r->str,"MASTERDOWN",10) == 0)
         {
             link->last_avail_time = mstime();
@@ -2717,6 +2754,10 @@ void addReplySentinelRedisInstance(client *c, sentinelRedisInstance *ri) {
 
     addReplyBulkCString(c,"down-after-milliseconds");
     addReplyBulkLongLong(c,ri->down_after_period);
+    fields++;
+
+    addReplyBulkCString(c,"loading-as-pong");
+    addReplyBulkLongLong(c,ri->loading_as_pong);
     fields++;
 
     /* Masters and Slaves */
@@ -3312,6 +3353,13 @@ void sentinelSetCommand(client *c) {
                 goto badfmt;
             ri->down_after_period = ll;
             sentinelPropagateDownAfterPeriod(ri);
+            changes++;
+        } else if (!strcasecmp(option,"loading-as-pong")) {
+            /* loading-as-pong <yes|no> */
+            if (0 != strcasecmp(value, "yes") && 0 != strcasecmp(value, "no"))
+                goto badfmt;
+            ri->loading_as_pong = (int)(0 == strcasecmp(value, "yes"));
+            sentinelPropagateLoadingIsPong(ri);
             changes++;
         } else if (!strcasecmp(option,"failover-timeout")) {
             /* failover-timeout <milliseconds> */
